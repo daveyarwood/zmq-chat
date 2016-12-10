@@ -1,0 +1,95 @@
+#!/usr/bin/env boot
+; vim: ft=clojure
+
+(set-env! :dependencies '[[io.djy/ezzmq "0.5.1"]
+                          [cheshire     "5.6.3"]
+                          [jline        "2.12.1"]])
+
+(require '[ezzmq.core    :as zmq]
+         '[cheshire.core :as json])
+
+(import '[jline.console ConsoleReader])
+
+(defn send-json
+  [socket x]
+  (zmq/send-msg socket (json/generate-string x)))
+
+(defn receive-json
+  [socket]
+  (-> (zmq/receive-msg socket :stringify true)
+      first
+      (json/parse-string true)))
+
+; FIXME: add timeout so this doesn't block if the server goes down
+(defn get-response
+  [socket request]
+  (send-json socket request)
+  (receive-json socket))
+
+(defn get-sub-port
+  [socket]
+  (let [{:keys [success body]} (get-response socket {:command "sub-port"})]
+    (if success
+      body
+      (throw (Exception. body)))))
+
+(defn join-chat
+  [socket user]
+  (let [{:keys [success body]} (get-response socket {:command "join"
+                                                     :user    user})]
+    (when-not success
+      (throw (Exception. body)))))
+
+(defn leave-chat
+  [socket user]
+  (let [{:keys [success body]} (get-response socket {:command "leave"
+                                                     :user    user})]
+    (when-not success
+      (throw (Exception. body)))))
+
+(defn send-message
+  [socket from body]
+  (let [{:keys [success body]} (get-response socket {:command "send-message"
+                                                     :from    from
+                                                     :body    body})]
+    (when-not success
+      (println "ERROR: Unable to send message."))))
+
+(defn -main
+  ([]
+   (-main "12345"))
+  ([port]
+   (zmq/with-new-context
+     (let [_        (println "Connecting to chat server...")
+           req      (zmq/socket :req {:connect (format "tcp://*:%s" port)})
+           sub-port (get-sub-port req)
+           sub      (zmq/socket :sub {:connect (format "tcp://*:%s" sub-port)})
+           username (do
+                      (print "Please enter your username: ")
+                      (flush)
+                      (read-line))]
+
+       (join-chat req username)
+
+       (zmq/before-shutdown
+         (leave-chat req username))
+
+       ; TODO: figure out how to do this without interleaving the CLI input and
+       ; received messages
+       (zmq/worker-thread {}
+         (let [cli (doto (ConsoleReader.)
+                     (.setExpandEvents false)
+                     (.setPrompt "> "))]
+           (while true
+             (println)
+             (let [msg (.readLine cli)]
+               (when-not (empty? msg)
+                 (send-message req username msg))))))
+
+       ; print messages as they are received
+       (zmq/polling {:stringify true}
+         [sub :pollin [[msg]]
+          (let [{:keys [from body]} (json/parse-string msg true)]
+            (println (format "%s> %s" from body)))]
+         (zmq/while-polling
+           (zmq/poll 1000)))))))

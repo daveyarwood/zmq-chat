@@ -1,0 +1,78 @@
+#!/usr/bin/env boot
+; vim: ft=clojure
+
+(set-env! :dependencies '[[io.djy/ezzmq "0.5.1"]
+                          [cheshire     "5.6.3"]])
+
+(require '[ezzmq.core    :as zmq]
+         '[cheshire.core :as json])
+
+(import '[java.net ServerSocket])
+
+(defn- find-open-port
+  []
+  (let [tmp-socket (ServerSocket. 0)
+        port       (.getLocalPort tmp-socket)]
+    (.close tmp-socket)
+    port))
+
+(defn- response-fn
+  [success?]
+  (fn [body]
+    (-> {:success success?
+         :body    body}
+        json/generate-string)))
+
+(def success-response (response-fn true))
+(def error-response   (response-fn false))
+
+(defn chat-server
+  [rep-port]
+  (let [pub-port    (find-open-port)
+        pub-address (format "tcp://*:%d" pub-port)
+        rep-address (format "tcp://*:%d" rep-port)]
+    (zmq/with-new-context
+      (let [_   (println
+                  (format "Starting message publisher at %s... " pub-address))
+            pub (zmq/socket :pub {:bind pub-address})
+            _   (println
+                  (format "Starting message receiver at %s... " rep-address))
+            rep (zmq/socket :rep {:bind rep-address})]
+        (zmq/polling {:stringify true}
+          [rep :pollin [msg]
+           (let [{:keys [command body] :as req}
+                 (json/parse-string (first msg) true)]
+             (case command
+               "join"
+               (let [{:keys [user]} req]
+                 (zmq/send-msg pub (json/generate-string
+                                     {:from "chat-server"
+                                      :body (format "%s joined." user)}))
+                 (zmq/send-msg rep (success-response "Successfully joined.")))
+
+               "leave"
+               (let [{:keys [user]} req]
+                 (zmq/send-msg pub (json/generate-string
+                                     {:from "chat-server"
+                                      :body (format "%s left." user)}))
+                 (zmq/send-msg rep (success-response "Successfully left.")))
+
+               "send-message"
+               (let [{:keys [from]} req]
+                 (zmq/send-msg pub (json/generate-string {:from from :body body}))
+                 (zmq/send-msg rep (success-response "Message sent.")))
+
+               "sub-port"
+               (zmq/send-msg rep (success-response pub-port))
+
+               (let [error (str "Unrecognized command: " command)]
+                 (println error)
+                 (zmq/send-msg rep (error-response error)))))]
+          (zmq/while-polling
+            (zmq/poll 1000)))))))
+
+(defn -main
+  ([]
+   (-main "12345"))
+  ([port]
+   (chat-server (Integer/parseInt port))))
